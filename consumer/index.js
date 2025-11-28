@@ -1,65 +1,42 @@
 const { Kafka } = require("kafkajs");
 const { Client } = require("pg");
 
-const kafka = new Kafka({
-    clientId: "consumer-app",
-    brokers: ["localhost:9092"],
-});
-
-const client = new Client({
-    host: "localhost",
-    port: 5300,
-    user: "admin",
-    password: "admin",
-    database: "pipeline",
-});
+const kafka = new Kafka({ clientId: "consumer-app", brokers: ["localhost:9092"] });
+const clientPG = new Client({ host: "localhost", port: 5300, user: "admin", password: "admin", database: "pipeline" });
 
 async function start() {
-    await client.connect();
-
-    await client.query(`
-    CREATE TABLE IF NOT EXISTS activity_logs (
+    await clientPG.connect();
+    await clientPG.query(`
+    CREATE TABLE IF NOT EXISTS sensor_readings (
       id SERIAL PRIMARY KEY,
-      user_id INT,
-      activity VARCHAR(50),
-      timestamp TIMESTAMP
-    );
-  `);
+      topic TEXT,
+      payload JSONB,
+      ts BIGINT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );`);
 
     const consumer = kafka.consumer({ groupId: "group-1" });
     await consumer.connect();
-    await consumer.subscribe({ topic: "activity-log" });
+    await consumer.subscribe({ topic: "activity-log", fromBeginning: false });
 
-    // Buffer untuk 50 pesan
     const buffer = [];
-    const batchSize = 50;
+    const BATCH_SIZE = 4;
 
     await consumer.run({
         eachMessage: async ({ message }) => {
-            const data = JSON.parse(message.value.toString());
-            buffer.push(data);
-
-            console.log("Received:", data);
-
-            if (buffer.length >= batchSize) {
-                const insertQuery = `
-                INSERT INTO activity_logs (user_id, activity, timestamp)
-                VALUES 
-                ${buffer.map((_, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`).join(",")}
-            `;
-
-                const values = buffer.flatMap((d) => [
-                    d.userId,
-                    d.activity,
-                    d.timestamp,
-                ]);
-
-                await client.query(insertQuery, values);
-                console.log(`Inserted batch of ${buffer.length} rows`);
-
-                buffer.length = 0; // clear buffer
+            const obj = JSON.parse(message.value.toString());
+            buffer.push([obj.topic, obj.payload ? JSON.parse(obj.payload) : null, obj.ts || Date.now()]);
+            if (buffer.length >= BATCH_SIZE) {
+                const valuesSQL = buffer.map((_, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`).join(",");
+                const flat = buffer.flat();
+                await clientPG.query(
+                    `INSERT INTO sensor_readings (topic, payload, ts) VALUES ${valuesSQL}`,
+                    flat
+                );
+                console.log(`Inserted ${buffer.length} rows`);
+                buffer.length = 0;
             }
-        },
+        }
     });
 }
 
